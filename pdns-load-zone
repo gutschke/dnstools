@@ -1,0 +1,88 @@
+#!/bin/bash -e
+
+# This script works similar to "pdnsutil load-zone". But in addition to
+# loading a zone file, it also does the normal book keeping involved with
+# setting up reasonable defaults for DNSSEC.
+
+# Copyright 2016, Markus Gutschke
+
+export LC_ALL=C
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+usage() {
+  echo "${0##*/} zone file" >&2
+  exit 1
+}
+
+[ $# -eq 2 ] || usage
+
+# Create a backup; just in case something goes wrong
+cp /var/lib/powerdns/pdns.sqlite3 /var/lib/powerdns/pdns.sqlite3.bak
+
+# Convert the zone file to SQL statements.
+sql="$(zone2sql --gsqlite --zone-name="${1}" --zone="${2}" |
+       grep -v '^insert into domains')"
+
+# Create the domain, if it doesn't exist yet; drop all records for this
+# domain; then insert replacement data. Run as a single atomic transaction
+# in case things go wrong.
+sqlite3 /var/lib/powerdns/pdns.sqlite3.bak "
+  BEGIN EXCLUSIVE;
+  INSERT INTO domains (name, type)
+    SELECT $(SQL_Escape "${1}"), 'MASTER'
+    WHERE NOT EXISTS (
+      SELECT *
+      FROM domains
+      WHERE name = $(SQL_Escape "${1}"));
+  DELETE
+    FROM records
+    WHERE EXISTS (
+      SELECT *
+      FROM domains
+      WHERE domains.id = records.domain_id AND
+            domains.name = $(SQL_Escape "${1}"));
+  ${sql}
+  COMMIT"
+
+# Allow AXFR transfers from our regular secondary DNS servers; unless
+# there already are existing records that govern AXFR transfers for this
+# particular zone.
+tsigkey="$(
+  sqlite3 /var/lib/powerdns/pdns.sqlite3 "
+    SELECT DISTINCT name
+    FROM tsigkeys" 2>/dev/null |
+  xargs | sed 's/\s\+/,/g')"
+[ -z "${tsigkey}" ] ||
+sqlite3 /var/lib/powerdns/pdns.sqlite3 "
+  INSERT
+    INTO domainmetadata (domain_id, kind, content)
+    SELECT id, 'TSIG-ALLOW-AXFR', $(SQL_Escape "${tsigkey}")
+    FROM domains
+    WHERE name = $(SQL_Escape "${1}") AND
+          NOT EXISTS (
+            SELECT 1
+            FROM domainmetadata
+            WHERE EXISTS (
+              SELECT 1
+              FROM domains
+              WHERE domainmetadata.kind = 'TSIG-ALLOW-AXFR' AND
+                    domainmetadata.domain_id = domains.id AND
+                    domains.name = $(SQL_Escape "${1}")))"
+
+# If the domain hasn't been secured for use with DNSSEC, then do that now.
+if [ "$(sqlite3 /var/lib/powerdns/pdns.sqlite3 "
+          SELECT COUNT(*)
+            FROM cryptokeys
+            WHERE EXISTS (
+              SELECT 1
+              FROM domains
+              WHERE cryptokeys.domain_id = domains.id AND
+                    domains.name = $(SQL_Escape "${1}"))")" -lt 2 ]; then
+  pdnssec secure-zone "${1}"
+  pdnssec set-nsec3 "${1}" "1 0 8 $(dd if=/dev/urandom count=64 2>&1 |
+                                    md5sum|dd bs=16 count=1 2>/dev/null)"
+  pdnssec unset-presigned "${1}"
+fi
+
+# Recompute DNSSEC records.
+pdnssec rectify-zone "${1}"

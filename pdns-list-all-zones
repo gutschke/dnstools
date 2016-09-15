@@ -1,0 +1,30 @@
+#!/bin/bash -e
+
+# This script works similar to "pdnsutil list-all-zones", which didn't
+# exist in older versions of PowerDNS.
+
+# Copyright 2016, Markus Gutschke
+
+export LC_ALL=C
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+usage() {
+  echo "${0##*/} { master | slave | native }" >&2
+  exit 1
+}
+
+where=
+[ $# -eq 0 ] || {
+  where='WHERE '
+  for i in "${@}"; do
+    case "$i" in
+      master) where="${where} type = 'MASTER' OR";;
+      slave)  where="${where} type = 'SLAVE' OR";;
+      native) where="${where} type = 'NATIVE' OR";;
+      *) usage;;
+    esac
+  done
+  where="${where% OR}"
+}
+
+exec sqlite3 /var/lib/powerdns/pdns.sqlite3 "SELECT DISTINCT name FROM domains ${where} ORDER BY name"

@@ -14,6 +14,12 @@ usage() {
   exit 1
 }
 
+SQL_Escape() { printf '%s' "'${*//\'/\'\'}'"; }
+pdnssec() {
+  local f="$(type -fp pdnssec)" 2>/dev/null
+  if [ -n "${f}" ]; then "${f}" "$@"; else pdnsutil "$@"; fi;
+}
+
 [ $# -eq 2 ] || usage
 
 # Create a backup; just in case something goes wrong

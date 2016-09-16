@@ -1,0 +1,63 @@
+#!/bin/bash -e
+
+# This script converts PowerDNS from a bind to a SQLite backend.
+# A custom schema definition can optionally be specified on the command line.
+
+# Copyright 2016, Markus Gutschke
+
+DIR=/var/lib/powerdns
+
+SQL_Escape() { printf '%s' "'${*//\'/\'\'}'"; }
+
+# Create empty sqlite3 database
+rm -f ${DIR}/pdns.sqlite3
+sqlite3 ${DIR}/pdns.sqlite3 <"${1:-/usr/share/doc/pdns-backend-sqlite3/schema.sqlite3.sql}"
+chown pdns:pdns ${DIR}/pdns.sqlite3
+chmod 640 ${DIR}/pdns.sqlite3
+
+# Migrate zone file data into sqlite3 database. Maintain original master and slave
+# functionality
+zone2sql --slave --named-conf=bindbackend.conf --gsqlite |
+  sed 's/NATIVE/MASTER/g' |
+  sqlite3 ${DIR}/pdns.sqlite3
+
+# Extract cryptokeys and domainmetadata from auxiliary sqlite3 database
+for i in cryptokeys domainmetadata; do
+  eval $i='()'
+  eval "$(sqlite3 ${DIR}/bind-dnssec-db.sqlite3 ".dump ${i}" |
+          sed -n '/INSERT/,${
+                    /CREATE/q
+                    /COMMIT/q
+                    s/'"'"'/"/g
+                    s/INSERT INTO "'"${i}"'" VALUES/'"${i}"'[${#'"${i}"'[@]}]='"'"'/
+                    s/;$/'"'"'/
+                    s/,/ /g
+                    p
+                  }')"
+done
+
+# Migrate cryptokeys table into new sqlite3 database
+for i in $(seq 0 $((${#cryptokeys[@]}-1))); do
+  eval record="${cryptokeys[$i]}"
+  # The only schema difference is that domains are referenced by id rather than by name
+  id="$(sqlite3 ${DIR}/pdns.sqlite3 "SELECT id FROM domains WHERE name = $(SQL_Escape "${record[1]}")")"
+  sqlite3 ${DIR}/pdns.sqlite3 "
+    INSERT INTO 'cryptokeys' VALUES(${record[0]},${id},${record[2]},${record[3]},$(SQL_Escape "${record[4]}"))"
+done
+
+# Migrate domainmetadata table into new sqlite3 database
+for i in $(seq 0 $((${#domainmetadata[@]}-1))); do
+  eval record="${domainmetadata[$i]}"
+  # The only schema difference is that domains are referenced by id rather than by name
+  id="$(sqlite3 ${DIR}/pdns.sqlite3 "SELECT id FROM domains WHERE name = $(SQL_Escape "${record[1]}")")"
+  sqlite3 ${DIR}/pdns.sqlite3 "
+    INSERT INTO 'domainmetadata' VALUES(${record[0]},${id},$(SQL_Escape "${record[2]}"),$(SQL_Escape "${record[3]}"))"
+done
+
+# Migrate tsigkeys table into new sqlite3 database; there is no schema difference
+sqlite3 ${DIR}/bind-dnssec-db.sqlite3 ".dump tsigkeys" |
+  grep 'INSERT INTO' |
+  sqlite3 ${DIR}/pdns.sqlite3
+
+# Success!
+echo DONE

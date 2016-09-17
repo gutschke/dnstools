@@ -85,8 +85,10 @@ if [ "$(sqlite3 /var/lib/powerdns/pdns.sqlite3 "
               WHERE cryptokeys.domain_id = domains.id AND
                     domains.name = $(SQL_Escape "${1}"))")" -lt 2 ]; then
   pdnssec secure-zone "${1}"
+  # We'd like to enable "narrow" mode, but that breaks compatibility with
+  # third-party slave DNS servers.
   pdnssec set-nsec3 "${1}" "1 0 8 $(dd if=/dev/urandom count=64 2>&1 |
-                                    md5sum|dd bs=16 count=1 2>/dev/null)" narrow
+                                    md5sum|dd bs=16 count=1 2>/dev/null)"
   pdnssec unset-presigned "${1}"
 fi
 

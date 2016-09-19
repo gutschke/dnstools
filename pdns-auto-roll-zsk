@@ -1,0 +1,60 @@
+#!/bin/bash -e
+
+# On a regular basis, the domain ZSK keys must be rolled. This script
+# performs the necessary operations to do so while making sure that the
+# DNS system stays consistent throughout the entire time.
+
+# Copyright 2016, Markus Gutschke
+
+export LC_ALL=C
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Find the zones served by our DNS server.
+[ $# -eq 0 ] && zones="$(pdns-list-all-zones master native)" || zones="$@"
+
+# Roll ZSK keys for all listed domains
+for z in ${zones}; do
+  # Remove all but one active and one inactive ZSK.
+  for id in $(
+    pdnsutil show-zone "${z}" 2>/dev/null |
+      sort -r -u |
+      sed '/(ZSK)/!d
+           /Active/{
+             x;/a/{x;s/^ID\s*=\s*\([0-9]\+\).*/\1/;t;d};s/.*/&a/;x }
+           /Active/!{
+             x;/i/{x;s/^ID\s*=\s*\([0-9]\+\).*/\1/;t;d};s/.*/&i/;x }
+           d'); do
+    pdnsutil remove-zone-key "${z}" "${id}"
+  done
+
+  # If there is no inactive ZSK, add one now.
+  old="$(pdnsutil show-zone "${z}" 2>/dev/null |
+         sed 's/^ID\s*=\s*\([0-9]\+\).*(ZSK).*Active.*/\1/;t1;d;:1;q')"
+  key="$(pdnsutil show-zone "${z}" 2>/dev/null |
+         sed 's/^ID\s*=\s*\([0-9]\+\).*(ZSK).*Inactive.*/\1/;t1;d;:1;q')"
+  if [ -z "${key}" ]; then
+    pdnsutil add-zone-key "${z}" zsk inactive rsasha256 4096 >&/dev/null
+    key="$(pdnsutil show-zone "${z}" 2>/dev/null |
+           sed 's/^ID\s*=\s*\([0-9]\+\).*(ZSK).*Inactive.*/\1/;t1;d;:1;q')"
+  fi
+
+  # Wait for changes to propagate to all DNS servers.
+  pdns-increase-serial "${z}"
+
+  # Activate new ZSK key
+  pdnsutil activate-zone-key "${z}" "${key}" >&/dev/null
+  [ -z "${old}" ] || pdnsutil deactivate-zone-key "${z}" "${old}" >&/dev/null
+
+  # Wait for changes to propagate to all DNS servers.
+  pdns-increase-serial "${z}"
+
+  # Remove old key. It is no longer needed.
+  if [ -n "${old}" ]; then
+    pdnsutil remove-zone-key "${z}" "${old}" >&/dev/null
+    pdns-increase-serial "${z}"
+  fi
+done
+
+unbound-control reload >&/dev/null || :
+
+exit 0

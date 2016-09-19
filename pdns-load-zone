@@ -75,6 +75,27 @@ sqlite3 /var/lib/powerdns/pdns.sqlite3 "
                     domainmetadata.domain_id = domains.id AND
                     domains.name = $(SQL_Escape "${1}")))"
 
+# Set SOA-EDIT to reasonable default value
+sqlite3 /var/lib/powerdns/pdns.sqlite3 "
+  INSERT
+    INTO domainmetadata (domain_id, kind, content)
+    SELECT id, 'SOA-EDIT', 'INCEPTION-INCREMENT'
+    FROM domains
+    WHERE name = $(SQL_Escape "${1}") AND
+          NOT EXISTS (
+            SELECT 1
+            FROM domainmetadata
+            WHERE EXISTS (
+              SELECT 1
+              FROM domains
+              WHERE domainmetadata.kind = 'SOA-EDIT' AND
+                    domainmetadata.domain_id = domains.id AND
+                    domains.name = $(SQL_Escape "${1}")))"
+
+# Force a reload, just in case the backend doesn't notice our changes
+# automatically
+pdns_control reload
+
 # If the domain hasn't been secured for use with DNSSEC, then do that now.
 if [ "$(sqlite3 /var/lib/powerdns/pdns.sqlite3 "
           SELECT COUNT(*)
@@ -84,7 +105,13 @@ if [ "$(sqlite3 /var/lib/powerdns/pdns.sqlite3 "
               FROM domains
               WHERE cryptokeys.domain_id = domains.id AND
                     domains.name = $(SQL_Escape "${1}"))")" -lt 2 ]; then
-  pdnssec secure-zone "${1}"
+  # PowerDNS now defaults to a combined signing key using ECDSA. That's
+  # not compatible with most registrars just yet.
+  # pdnssec secure-zone "${1}"
+  pdnssec add-zone-key "${1}" ksk 4096    active rsasha256
+  pdnssec add-zone-key "${1}" zsk 4096    active rsasha256
+  pdnssec add-zone-key "${1}" zsk 4096  inactive rsasah256
+
   # We'd like to enable "narrow" mode, but that breaks compatibility with
   # third-party slave DNS servers.
   pdnssec set-nsec3 "${1}" "1 0 8 $(dd if=/dev/urandom count=64 2>&1 |

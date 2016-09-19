@@ -1,0 +1,119 @@
+#!/bin/bash -e
+
+# This script sets up a new master zone.
+
+# Copyright 2016, Markus Gutschke
+
+export LC_ALL=C
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+SQL_Escape() { printf '%s' "'${*//\'/\'\'}'"; }
+
+usage() {
+  echo "${0##*/} { zone }" >&2
+  exit 1
+}
+
+# Basic sanity checking.
+[ $# -eq 1 ] || usage
+pdnsutil list-zone "${1}" >&/dev/null && {
+  echo "Zone \"$1\" already exists" >&2
+  exit 1
+}
+
+# Determine the name servers for this domain
+for rootserver in $(for i in $(seq 1 26); do
+                      printf $(printf '\\%03o.root-servers.net\\n' $((i+96)))
+                    done |
+                    sort --random-sort); do
+  rootservers="$(dig @${rootserver} "$1" NS 2>/dev/null |
+                 sed 's/\s*;.*//;/^\s*$/d
+                      s/^\s*\S\+\.\s\+[0-9]*\s\+IN\s\+NS\s\+\(.\+\)\.$/\1/i
+                      t;d' |
+                 sort --random-sort)" || continue
+  [ -n "${rootservers}" ] && break
+done
+for rootserver in ${rootservers}; do
+  ns="$(dig @${rootserver} "$1" NS 2>/dev/null |
+        sed 's/\s*;.*//;/^\s*$/d
+             s/^\s*'"${1}"'\.\s\+[0-9]*\s\+IN\s\+NS\s\+\(.\+\)\.$/\1/i
+             t;d' |
+        tr A-Z a-z |
+        sort -u)" || continue
+  [ -n "${ns}" ] && break
+done
+[ -z "${ns}" ] && {
+  echo "There is no record of zone \"$1\" existing on the internet." >&2
+  echo "Contact a public domain registrar to buy the domain." >&2
+  exit 1
+}
+
+# If there is a name server in our own domain, make that the master.
+for n in ${ns}; do
+  [[ "${n}" =~ $1$ ]] && { master="${n}"; break; }
+done
+
+# Otherwise, find the closest name server. That's probably going to be
+# the master.
+[ -n "${master}" ] ||
+  master="$(
+    for n in ${ns}; do
+      ping -c1 -W1 "$n" |
+        sed "s/.*time=\([.0-9]\+\).*/\1 $n/;t;d"
+    done |
+    sort |
+    sed '1s/\S*\s*//;q')"
+
+# Re-order name servers in a more logical order.
+ns="$(echo "${master}"
+      echo "${ns}" |
+        grep -v "${master}" |
+        sort -u)"
+[ -n "${master}" ] || {
+  echo "Cannot determinate primary DNS server." >&2
+  exit 1
+}
+
+# Determine our IPv4 network information, so that we can pre-populate the
+# zone with reasonable default values.
+ifc="$(
+  route -n | sed 's/^0\.0\.0\.0\s.*\s\(\S\+\)$/\1/;t1;d;:1;q')"
+net="$(route -n | sed "s/^\(\S\+\).*\s${ifc}"'$/\1/
+  t1;d;:1
+  /0\.0\.0\.0/d;/^10\./d;/^172\.\(1[6-9]\|2\|3[01]\)/d;/^192\.168\./d
+  q')"
+pat="${net}"
+while [ -n "${pat}" ]; do
+  ip="$(ip addr show dev "${ifc}" |
+          sed "s/.*inet\s\+\(${pat}[.0-9]*\/[0-9]\+\).*${ifc}\$/\1/;t1;d;:1;q")"
+  [ -z "${ip}" ] || {
+    net="${net}/${ip#*/}"
+    ip="${ip%/*}"
+    break
+  }
+  pat="${pat%?}"
+done
+[ -n "${ip}" ] || {
+  echo "Cannot determine our own IP address." >&2
+  exit 1
+}
+
+# Generate a minimal zone and load it into the DNS server.
+pdns-load-zone "$1" <(
+cat <<EOF
+\$ORIGIN $1.
+@ 43200 IN SOA ${master}. root.$1. $(date +%Y%m%d00) 43200 1800 604800 43200
+	A	${ip}
+$(echo "${ns}" | sed 's/.*/\tNS\t&./')
+	MX	10 smtp.$1.
+	TXT	"v=spf1 ip4:${net} a include:_spf.google.com ~all"
+*	MX	10 smtp.$1.
+	TXT	"v=spf1 ip4:${net} a include:_spf.google.com ~all"
+www	A	${ip}
+	MX	10 smtp.$1.
+	TXT	"v=spf1 ip4:${net} a include:_spf.google.com ~all"
+smtp	A	${ip}
+	MX	10 smtp.$1.
+	TXT	"v=spf1 ip4:${net} a include:_spf.google.com ~all"
+EOF
+)

@@ -1,0 +1,26 @@
+#!/bin/bash -e
+
+# This script sets up a new slave zone.
+
+# Copyright 2016, Markus Gutschke
+
+export LC_ALL=C
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+SQL_Escape() { printf '%s' "'${*//\'/\'\'}'"; }
+
+usage() {
+  echo "${0##*/} { zone } { master ip address }" >&2
+  exit 1
+}
+
+[ $# -eq 2 ] || usage
+pdnsutil list-zone "${1}" >&/dev/null && {
+  echo "Zone \"$1\" already exists" >&2
+  exit 1
+}
+pdnsutil create-zone "${1}" || :
+pdnsutil set-kind "${1}" slave
+sqlite3 /var/lib/powerdns/pdns.sqlite3 "UPDATE domains SET master = $(SQL_Escape "${2}") WHERE name = $(SQL_Escape "${1}")"
+pdns_control reload
+pdns_control retrieve "${1}"

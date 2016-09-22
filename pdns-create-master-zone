@@ -102,8 +102,8 @@ done
 pdns-load-zone "$1" <(
 cat <<EOF
 \$ORIGIN $1.
-@ 43200 IN SOA ${master}. root.$1. $(date +%Y%m%d00) 43200 1800 604800 43200
-	A	${ip}
+@ 1800 IN SOA ${master}. root.$1. $(date +%Y%m%d00) 1800 600 86400 600
+  3600	A	${ip}
 $(echo "${ns}" | sed 's/.*/\tNS\t&./')
 	MX	10 smtp.$1.
 	TXT	"v=spf1 ip4:${net} a include:_spf.google.com ~all"

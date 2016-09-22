@@ -12,12 +12,22 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 SQL_Escape() { printf '%s' "'${*//\'/\'\'}'"; }
 
+dig() {
+  local retry
+  for retry in $(seq 10); do
+    local ret="$($(type -fp dig) "$@")"
+    local rc="$?"
+    [[ "${ret}" =~ .*"SERVFAIL".* ]] || break
+    sleep 6
+  done
+  echo "${ret}"
+  return ${rc}
+}
+
 # Find the zones served by our DNS server.
 [ $# -eq 0 ] && zones="$(pdns-list-all-zones master native)" || zones="$@"
 
 for i in ${zones}; do
-  ser="$(pdnsutil increase-serial "${i}" 2>/dev/null |
-         sed 's/.*\s\+//;t1;d;:1;q')"
   master="$(sqlite3 /var/lib/powerdns/pdns.sqlite3 "
             SELECT content
             FROM records
@@ -31,9 +41,13 @@ for i in ${zones}; do
                     FROM domains
                     WHERE InStr(records.content, domains.name) AND
                           domains.type != 'SLAVE')")"
+  pdnsutil increase-serial "${i}" >&/dev/null
+  pdnsutil rectify-zone "${i}" >&/dev/null || :
+  ser="$(dig +short @"${master}" "${i}" SOA 2>/dev/null |
+         awk '{ print $3 }')"
   for ns in ${master}; do
     for j in $(seq 10); do
-      [ "$(dig +tries=7 +time=8 +short @"${ns}" "${i}" SOA 2>/dev/null |
+      [ "$(dig +time=8 +short @"${ns}" "${i}" SOA 2>/dev/null |
            awk '{ print $3 }')" != "${ser}" ] || break
       sleep 5
     done
@@ -49,7 +63,7 @@ for i in ${zones}; do
   for ns in ${nameservers}; do
     [[ "${master}" =~ .*"${ns}".* ]] && continue
     for j in $(seq 10); do
-      [ "$(dig +tries=7 +time=8 +short @"${ns}" "${i}" SOA 2>/dev/null |
+      [ "$(dig +time=8 +short @"${ns}" "${i}" SOA 2>/dev/null |
            awk '{ print $3 }')" != "${ser}" ] || break
       pdns_control notify-host "${i}" \
                    "$(host -tA ${ns} 2>/dev/null |

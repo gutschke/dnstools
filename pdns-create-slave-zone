@@ -22,5 +22,6 @@ pdnsutil list-zone "${1}" >&/dev/null && {
 pdnsutil create-zone "${1}" || :
 pdnsutil set-kind "${1}" slave
 sqlite3 /var/lib/powerdns/pdns.sqlite3 "UPDATE domains SET master = $(SQL_Escape "${2}") WHERE name = $(SQL_Escape "${1}")"
-pdns_control reload
-pdns_control retrieve "${1}"
+pdns_control purge "${1}" || :
+pdns_control reload || :
+pdns_control retrieve "${1}" || :

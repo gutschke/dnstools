@@ -41,18 +41,17 @@ for i in ${zones}; do
                     FROM domains
                     WHERE InStr(records.content, domains.name) AND
                           domains.type != 'SLAVE')")"
-  pdnsutil increase-serial "${i}" >&/dev/null
-  pdnsutil rectify-zone "${i}" >&/dev/null || :
-  ser="$(dig +short @"${master}" "${i}" SOA 2>/dev/null |
+  old="$(dig +short @"${master}" "${i}" SOA 2>/dev/null |
          awk '{ print $3 }')"
-  for ns in ${master}; do
-    for j in $(seq 10); do
-      [ "$(dig +time=8 +short @"${ns}" "${i}" SOA 2>/dev/null |
-           awk '{ print $3 }')" != "${ser}" ] || break
-      sleep 5
-    done
+  pdnsutil increase-serial "${i}" >&/dev/null
+  while :; do
+    pdns_control purge "${i}" >&/dev/null || :
+    pdnsutil rectify-zone "${i}" >&/dev/null || :
+    ser="$(dig +short @"${master}" "${i}" SOA 2>/dev/null |
+           awk '{ print $3 }')"
+    [ "${old}" != "${ser}" ] && break
+    sleep .5
   done
-  pdns_control notify "${i}" >&/dev/null
   nameservers="$(sqlite3 /var/lib/powerdns/pdns.sqlite3 "
     SELECT content
     FROM records
@@ -62,13 +61,10 @@ for i in ${zones}; do
       WHERE name = $(SQL_Escape "${i}"))")"
   for ns in ${nameservers}; do
     [[ "${master}" =~ .*"${ns}".* ]] && continue
-    for j in $(seq 10); do
+    for j in $(seq 50); do
       [ "$(dig +time=8 +short @"${ns}" "${i}" SOA 2>/dev/null |
            awk '{ print $3 }')" != "${ser}" ] || break
-      pdns_control notify-host "${i}" \
-                   "$(host -tA ${ns} 2>/dev/null |
-                      sed 's/.*\s\+//;t1;d;:1;q')" >&/dev/null
-      sleep 10
+        sleep 3
     done
   done
 done

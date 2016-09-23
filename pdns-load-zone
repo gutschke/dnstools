@@ -94,6 +94,7 @@ sqlite3 /var/lib/powerdns/pdns.sqlite3 "
 
 # Force a reload, just in case the backend doesn't notice our changes
 # automatically
+pdns_control purge "${1}" || :
 pdns_control reload
 
 # If the domain hasn't been secured for use with DNSSEC, then do that now.

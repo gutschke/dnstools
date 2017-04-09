@@ -7,6 +7,8 @@
 
 # Copyright 2016, Markus Gutschke
 
+from collections import OrderedDict
+
 import StringIO
 import copy
 import dns.query
@@ -94,41 +96,66 @@ if len(lines) < 1:
     print(';; OBTAINED ZONE FILE BY AXFR TRANSFER FROM NAMESERVER')
   else:
     # AXFR didn't work. Let's see if we can get at least partial data
-    # from an ANY query
-    response = None
-    try:
-      request = dns.message.make_query(zone, dns.rdatatype.ANY)
-      request.flags |= dns.flags.AD
-      request.find_rrset(request.additional, dns.name.root, 65535,
-                         dns.rdatatype.OPT, create=True, force_unique=True)
-      ns = dns.resolver.get_default_resolver().nameservers
-      for n in ns:
+    # from a couple of DNS transfers
+    hosts = [ zone, "www." + zone, "_dmarc." + zone, "_domainkey." + zone,
+              "_policy._domainkey." + zone, "*." + zone ]
+    todo = hosts[:]
+    while len(todo) > 0:
+      host = todo.pop(0)
+      for rr_type in [ 1, 2, 5, 6, 12, 15, 16, 17, 18, 28, 29, 33, 35, 36, 37,
+                       39, 42, 43, 44, 45, 48, 49, 52, 59, 60, 249, 256, 257 ]:
+        if rr_type == 255:
+          continue
+
+        response = None
         try:
-          response = dns.query.udp(request, n)
-          if len(response.answer) > 0:
-            response = response.answer
-            break
-          response = None
+          request = dns.message.make_query(host, rr_type)
+          request.flags |= dns.flags.AD
+          request.find_rrset(request.additional, dns.name.root, 65535,
+                             dns.rdatatype.OPT, create=True, force_unique=True)
+          ns = dns.resolver.get_default_resolver().nameservers
+          for n in ns:
+            try:
+              response = dns.query.udp(request, n)
+              if len(response.answer) > 0:
+                response = response.answer
+
+                for candidate in \
+                  [ re.search(r'([-a-zA-Z0-9.]+\.' + zone.replace('.', r'\.') + r')', l).group(0) \
+                    for rr in response for l in rr.to_text().splitlines() \
+                    if re.search(r'\.' + zone.replace('.', r'\.') + r'\.',
+                                 rr.to_text()) ]:
+                  if not candidate in hosts:
+                    hosts.append(candidate)
+                    todo.append(candidate)
+
+                break
+              response = None
+            except Exception:
+              response = None
+              pass
         except Exception:
-          response = None
           pass
-    except Exception:
-      pass
+
+        if not response:
+          continue
+
+        if len(lines) == 0:
+          # Print a warning messages and then process the result set
+          print(';; WARNING!!! THIS IS AN INCOMPLETE ZONE FILE\n' +
+                ';; "AXFR" TRANSFER WAS DENIED. USED "ANY" QUERY INSTEAD')
+
+        lines += [ l for rr in response for l in rr.to_text().splitlines() \
+                   if not re.match(r'(\S+\s+){3}(RRSIG|NSEC3?(PARAM)?|DNSKEY)',
+                                   rr.to_text()) ]
 
     # Didn't receive any data back for our query. There really is nothing
     # left to do any more
-    if not response:
+    if len(lines) == 0:
       sys.stderr.write('Unable to do either AXFR zone transfer or ' +
                        'ANY query for "{}". Also no entries found in "{}" ' +
                        'database file.\n'.format(zone, db))
       exit(1)
-
-    # Print a warning messages and then process the result set
-    print(';; WARNING!!! THIS IS AN INCOMPLETE ZONE FILE\n' +
-          ';; "AXFR" TRANSFER WAS DENIED. USED "ANY" QUERY INSTEAD')
-    lines = [ l for rr in response for l in rr.to_text().splitlines() \
-              if not re.match(r'(\S+\s+){3}(RRSIG|NSEC3?(PARAM)?|DNSKEY)',
-                              rr.to_text()) ]
 
 # Extract a list of known A records. This will be used in sorting
 hosts = { }
@@ -183,6 +210,7 @@ def cmp(a, b):
     if x < y or f1[0] < f2[0]:
       result = -1
   return result
+lines = list(OrderedDict.fromkeys(lines))
 lines.sort(key=functools.cmp_to_key(cmp))
 
 # Compute the widths of individual fields (after pruning, where possible)
@@ -191,6 +219,8 @@ d = ['', '', '']
 records = [ ]
 for r in lines:
   f = r.rstrip().split(None, 4)
+  if f[3] == 'TYPE257':
+    f[3] = 'CAA'
   # Remove zone name from host names
   if f[0].endswith('.' + zone + '.'):
     f[0] = f[0][:-len('.' + zone + '.')]

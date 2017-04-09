@@ -8,6 +8,14 @@
 export LC_ALL=C
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
+# Use lxc, if necessary
+LXC=
+if lxc info pdns >&/dev/null; then
+  LXC="lxc exec pdns --"
+fi
+
+db="/var/lib/powerdns/pdns.sqlite3"
+
 usage() {
   echo "${0##*/} { master | slave | native }" >&2
   exit 1
@@ -27,4 +35,5 @@ where=
   where="${where% OR}"
 }
 
-exec sqlite3 /var/lib/powerdns/pdns.sqlite3 "SELECT DISTINCT name FROM domains ${where} ORDER BY name"
+exec $LXC sqlite3 "${db}" "
+  SELECT DISTINCT name FROM domains ${where} ORDER BY name"

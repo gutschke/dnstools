@@ -7,6 +7,13 @@
 export LC_ALL=C
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
+# Use lxc, if necessary
+LXC=
+if lxc info pdns >&/dev/null; then
+  LXC="lxc exec pdns --"
+fi
+
+db="/var/lib/powerdns/pdns.sqlite3"
 SQL_Escape() { printf '%s' "'${*//\'/\'\'}'"; }
 
 usage() {
@@ -15,13 +22,13 @@ usage() {
 }
 
 [ $# -eq 2 ] || usage
-pdnsutil list-zone "${1}" >&/dev/null && {
+$LXC pdnsutil list-zone "${1}" >&/dev/null && {
   echo "Zone \"$1\" already exists" >&2
   exit 1
 }
-pdnsutil create-zone "${1}" || :
-pdnsutil set-kind "${1}" slave
-sqlite3 /var/lib/powerdns/pdns.sqlite3 "UPDATE domains SET master = $(SQL_Escape "${2}") WHERE name = $(SQL_Escape "${1}")"
-pdns_control purge "${1}" || :
-pdns_control reload || :
-pdns_control retrieve "${1}" || :
+$LXC pdnsutil create-zone "${1}" || :
+$LXC pdnsutil set-kind "${1}" slave
+$LXC sqlite3 "${db}" "UPDATE domains SET master = $(SQL_Escape "${2}") WHERE name = $(SQL_Escape "${1}")"
+$LXC pdns_control purge "${1}" || :
+$LXC pdns_control reload || :
+$LXC pdns_control retrieve "${1}" || :

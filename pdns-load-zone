@@ -14,25 +14,53 @@ usage() {
   exit 1
 }
 
+# Use lxc, if necessary
+LXC=
+if lxc info pdns >&/dev/null; then
+  LXC="lxc exec pdns --"
+fi
+
+db="/var/lib/powerdns/pdns.sqlite3"
 SQL_Escape() { printf '%s' "'${*//\'/\'\'}'"; }
 pdnssec() {
   local f="$(type -fp pdnssec)" 2>/dev/null
-  if [ -n "${f}" ]; then "${f}" "$@"; else pdnsutil "$@"; fi;
+  if [ -n "${f}" ]; then $LXC "${f}" "$@"; else $LXC pdnsutil "$@"; fi
 }
 
 [ $# -eq 2 ] || usage
 
 # Create a backup; just in case something goes wrong
-cp /var/lib/powerdns/pdns.sqlite3 /var/lib/powerdns/pdns.sqlite3.bak
+$LXC cp "${db}" "${db}.bak"
 
-# Convert the zone file to SQL statements.
-sql="$(zone2sql --gsqlite --zone-name="${1}" --zone="${2}" |
+# Extract serial number from existing SOA record, if any.
+soa=( $($LXC sqlite3 "${db}" "
+  SELECT content
+  FROM records
+  WHERE type = 'SOA' AND
+    domain_id IN (
+    SELECT id
+    FROM domains
+    WHERE name = $(SQL_Escape "${1}"))") ); soa="${soa[2]}"
+
+# Convert the zone file to SQL statements. There appears to be a bug in parsing
+# SVR records, so make sure to rewrite them a little bit. The leading space
+# character works around the bug.
+sql="$(zone2sql --gsqlite --zone-name="${1}" \
+                --zone=<(sed 's/\(SRV\s\+\)\(.*\)/\1( \2)/' "$2") |
        grep -v '^insert into domains')"
+
+nsoa="$(awk '$10 == "'\'SOA\','" { print $13 }' <(echo "${sql}"))"
+
+if [ -n "${soa}" -a -n "${nsoa}" -a "${nsoa}" -le "${soa}" ]; then
+  # Make sure that the serial number increases
+  sql="$(echo "${sql}" |
+         sed "s/\( select id ,'[^']\+', 'SOA', '\s*\S\+\s\+\S\+\s\+\)${nsoa}\(\s\)/\1$((soa+1))\2/")"
+fi
 
 # Create the domain, if it doesn't exist yet; drop all records for this
 # domain; then insert replacement data. Run as a single atomic transaction
 # in case things go wrong.
-sqlite3 /var/lib/powerdns/pdns.sqlite3.bak "
+$LXC sqlite3 "${db}" "
   BEGIN EXCLUSIVE;
   INSERT INTO domains (name, type)
     SELECT $(SQL_Escape "${1}"), 'MASTER'
@@ -54,12 +82,12 @@ sqlite3 /var/lib/powerdns/pdns.sqlite3.bak "
 # there already are existing records that govern AXFR transfers for this
 # particular zone.
 tsigkey="$(
-  sqlite3 /var/lib/powerdns/pdns.sqlite3 "
+  $LXC sqlite3 "${db}" "
     SELECT DISTINCT name
     FROM tsigkeys" 2>/dev/null |
   xargs | sed 's/\s\+/,/g')"
 [ -z "${tsigkey}" ] ||
-sqlite3 /var/lib/powerdns/pdns.sqlite3 "
+$LXC sqlite3 "${db}" "
   INSERT
     INTO domainmetadata (domain_id, kind, content)
     SELECT id, 'TSIG-ALLOW-AXFR', $(SQL_Escape "${tsigkey}")
@@ -76,7 +104,7 @@ sqlite3 /var/lib/powerdns/pdns.sqlite3 "
                     domains.name = $(SQL_Escape "${1}")))"
 
 # Set SOA-EDIT to reasonable default value
-sqlite3 /var/lib/powerdns/pdns.sqlite3 "
+$LXC sqlite3 "${db}" "
   INSERT
     INTO domainmetadata (domain_id, kind, content)
     SELECT id, 'SOA-EDIT', 'INCEPTION-INCREMENT'
@@ -94,11 +122,11 @@ sqlite3 /var/lib/powerdns/pdns.sqlite3 "
 
 # Force a reload, just in case the backend doesn't notice our changes
 # automatically
-pdns_control purge "${1}" || :
-pdns_control reload
+$LXC pdns_control purge "${1}" || :
+$LXC pdns_control reload
 
 # If the domain hasn't been secured for use with DNSSEC, then do that now.
-if [ "$(sqlite3 /var/lib/powerdns/pdns.sqlite3 "
+if [ "$($LXC sqlite3 "${db}" "
           SELECT COUNT(*)
             FROM cryptokeys
             WHERE EXISTS (
@@ -122,3 +150,6 @@ fi
 
 # Recompute DNSSEC records.
 pdnssec rectify-zone "${1}"
+
+# Sanity check
+$LXC pdnsutil check-zone "${1}"

@@ -1,0 +1,35 @@
+#!/bin/bash -e
+
+# Block a domain that has been used for spam, by entering a bogus MX record.
+
+# Copyright 2016, Markus Gutschke
+
+export LC_ALL=C
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+[ $# -eq 1 ] && [[ "${1}" =~ ^[-a-z0-9]+\.[-a-z0-9]+\.[-a-z0-9]+$ ]] ||
+  { echo "Usage: ${0##*/} <domain>" >&2; exit 1; }
+
+# Use lxc, if necessary
+LXC=
+if lxc info pdns >&/dev/null; then
+  LXC="lxc exec pdns --"
+fi
+
+db="/var/lib/powerdns/pdns.sqlite3"
+SQL_Escape() { printf '%s' "'${*//\'/\'\'}'"; }
+
+$LXC sqlite3 "${db}" "
+  DELETE
+    FROM records
+    WHERE name = $(SQL_Escape "${1}") AND
+      type = 'MX' AND
+      content = 'localhost' AND
+      prio = 10 AND
+      EXISTS (
+      SELECT *
+      FROM domains
+      WHERE domains.id = records.domain_id AND
+            domains.name = $(SQL_Escape "${1#*.}"));"
+
+exec pdns-increase-serial "${1#*.}"

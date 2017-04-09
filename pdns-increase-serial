@@ -10,6 +10,13 @@
 export LC_ALL=C
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
+# Use lxc, if necessary
+LXC=
+if lxc info pdns >&/dev/null; then
+  LXC="lxc exec pdns --"
+fi
+
+db="/var/lib/powerdns/pdns.sqlite3"
 SQL_Escape() { printf '%s' "'${*//\'/\'\'}'"; }
 
 dig() {
@@ -28,7 +35,7 @@ dig() {
 [ $# -eq 0 ] && zones="$(pdns-list-all-zones master native)" || zones="$@"
 
 for i in ${zones}; do
-  master="$(sqlite3 /var/lib/powerdns/pdns.sqlite3 "
+  master="$($LXC sqlite3 "${db}" "
             SELECT content
             FROM records
             WHERE type = 'NS' AND
@@ -43,16 +50,16 @@ for i in ${zones}; do
                           domains.type != 'SLAVE')")"
   old="$(dig +short @"${master}" "${i}" SOA 2>/dev/null |
          awk '{ print $3 }')"
-  pdnsutil increase-serial "${i}" >&/dev/null
+  $LXC pdnsutil increase-serial "${i}" >&/dev/null
   while :; do
-    pdns_control purge "${i}" >&/dev/null || :
-    pdnsutil rectify-zone "${i}" >&/dev/null || :
+    $LXC pdns_control purge "${i}" >&/dev/null || :
+    $LXC pdnsutil rectify-zone "${i}" >&/dev/null || :
     ser="$(dig +short @"${master}" "${i}" SOA 2>/dev/null |
            awk '{ print $3 }')"
     [ "${old}" != "${ser}" ] && break
     sleep .5
   done
-  nameservers="$(sqlite3 /var/lib/powerdns/pdns.sqlite3 "
+  nameservers="$($LXC sqlite3 "${db}" "
     SELECT content
     FROM records
     WHERE type = 'NS' AND domain_id IN (
@@ -64,7 +71,9 @@ for i in ${zones}; do
     for j in $(seq 50); do
       [ "$(dig +time=8 +short @"${ns}" "${i}" SOA 2>/dev/null |
            awk '{ print $3 }')" != "${ser}" ] || break
-        sleep 3
+      [ $((j%4)) -eq 1 ] &&
+        $LXC pdns_control notify-host "${i}" "${ns}" >&/dev/null || :
+      sleep $((1+(j%4)))
     done
   done
 done

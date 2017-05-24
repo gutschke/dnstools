@@ -116,7 +116,7 @@ if len(lines) < 1:
           ns = dns.resolver.get_default_resolver().nameservers
           for n in ns:
             try:
-              response = dns.query.udp(request, n)
+              response = dns.query.udp(request, n, timeout=5)
               if len(response.answer) > 0:
                 response = response.answer
 

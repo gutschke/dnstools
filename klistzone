@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+
+# This script tries to list a zone file. In addition to reading from
+# the underlying on-disk file, it can perform DNS queries to obtain
+# the required data. Also, it makes some effort to pretty-print the
+# zone file in a format that is readable to humans.
+
+# Copyright 2016, 2023 Markus Gutschke
+
+from io import StringIO
+import copy
+import dns.query
+import dns.rdatatype
+import dns.resolver
+import dns.zone
+import functools
+import re
+import sqlite3
+import sys
+
+# We accept exactly one command line argument
+if len(sys.argv) != 2:
+  sys.stderr.write('Usage: {} ZONE\n'.format(re.sub(r'.*/', '', sys.argv[0])))
+  exit(1)
+zone = sys.argv[1].rstrip('.')
+
+# Try loading the zone file directly from the local on-disk file. That's
+# the most expedient solution, but obviously only works if we have direct
+# access to the name server.
+zonefile = '/var/lib/knot/' + zone + '.zone'
+lines = [ ]
+try:
+  with open(zonefile, 'r') as f:
+    lines = [ re.sub(r'^((\S+\s+){2})(.*)', r'\1IN\t\3',
+              re.sub(r'\s*;.*', '',
+              ' '.join(line.split()))) for line in f ]
+    lines = [ line for line in lines if not len(line) == 0 ]
+  if len(lines) > 0:
+    print(';; ZONE FILE READ FROM "{}"'.format(zonefile))
+except Exception:
+  pass
+
+# If we couldn't read from local storage, check if we can obtain the
+# required information by performing a DNS lookup, instead.
+if len(lines) < 1:
+  ns = None
+  adminServer = None
+  adminPort = 53
+
+  # Some of our own zones have an authoritative name server for handling
+  # regular queries, but have another server that is prefered for
+  # administrative tasks such as updates and/or zone transfers. Check
+  # whether this applies.
+  try:
+    ns = dns.resolver.resolve('_ddns._udp.' + zone, 'SRV')
+    if ns and len(ns) >= 1:
+      srv = ns[0].to_text().split();
+      adminServer = srv[3]
+      adminPort = int(srv[2])
+  except Exception:
+    pass
+    exit(0)
+
+  # Find the authoritative name servers for this zone.
+  if not adminServer:
+    try:
+      ns = dns.resolver.resolve(zone, 'NS')
+    except Exception:
+      pass
+    if ns == None or len(ns) < 1:
+      sys.stderr.write(('Cannot find records for zone "{}" in "{}", nor find ' +
+                        'any authoritative nameservers.\n').
+                       format(zone, zonefile))
+      exit(1)
+
+  # Try to do a zone transfer
+  for server in ns:
+    # Override the default server option and use the one from the SRV
+    # record
+    if adminServer:
+      server = adminServer
+      port = adminPort
+    else:
+      port = 53
+
+    try:
+      str = StringIO()
+      master = dns.resolver.resolve(server, "A")
+      axfr = dns.query.xfr(master[0].address, zone, timeout=10, port=port,
+                          lifetime=10, relativize=False)
+      axfrZone = dns.zone.from_xfr(axfr, relativize=False)
+      axfrZone.to_file(str, relativize=False, nl='\n')
+      lines = [ l for l in str.getvalue().splitlines() \
+                if not re.match(r'(\S+\s+){3}(DHCID|RRSIG|NSEC3?(PARAM)?|DNSKEY)', l) ]
+      str.close()
+      break
+    except Exception:
+      pass
+
+  if len(lines) > 0:
+    print(';; OBTAINED ZONE FILE BY AXFR TRANSFER FROM NAMESERVER')
+  else:
+    # AXFR didn't work. Let's see if we can get at least partial data
+    # from an ANY query
+    response = None
+    try:
+      request = dns.message.make_query(zone, dns.rdatatype.ANY)
+      request.flags |= dns.flags.AD
+      request.find_rrset(request.additional, dns.name.root, 65535,
+                         dns.rdatatype.OPT, create=True, force_unique=True)
+      ns = resolver.get_default_resolver().nameservers
+      for n in ns:
+        try:
+          response = resolver.query.udp(request, n)
+          if len(response.answer) > 0:
+            response = response.answer
+            break
+          response = None
+        except Exception:
+          response = None
+          pass
+    except Exception:
+      pass
+
+    # Didn't receive any data back for our query. There really is nothing
+    # left to do any more
+    if not response:
+      sys.stderr.write(('Unable to do either AXFR zone transfer or ' +
+                       'ANY query for "{}". Also no entries found in "{}" ' +
+                       'file.\n').format(zone, zonefile))
+      exit(1)
+
+    # Print a warning messages and then process the result set
+    print(';; WARNING!!! THIS IS AN INCOMPLETE ZONE FILE\n' +
+          ';; "AXFR" TRANSFER WAS DENIED. USED "ANY" QUERY INSTEAD')
+    lines = [ l for rr in response for l in rr.to_text().splitlines() \
+              if not re.match(r'(\S+\s+){3}(DHCID|RRSIG|NSEC3?(PARAM)?|DNSKEY)',
+                              rr.to_text()) ]
+
+# Extract a list of known A records. This will be used in sorting
+hosts = { }
+for r in lines:
+  f = r.split()
+  if f[3] == 'A':
+    hosts[f[0]] = f[4]
+
+# Sort lines to be in a more human-friendly natural order
+def cmp(a, b):
+  f1 = a.split(None, 5)
+  f2 = b.split(None, 5)
+  result = 1
+  # The zone name information should always be first. In particular, this means
+  # that the SOA record is always the very first line
+  if (f1[0] == zone + '.') != (f2[0] == zone + '.'):
+    if f1[0] == zone + '.': result = -1
+  # SRV resource records always come last
+  elif (f1[3] == 'SRV') != (f2[3] == 'SRV'):
+    if f2[3] == 'SRV': result = -1
+  # The zone name information is followed by wild-card host names, if any
+  elif f1[0].startswith('*') != f2[0].startswith('*'):
+    if f1[0].startswith('*'): result = -1
+  # Host names that define services come at the end
+  elif f1[0].startswith('_') != f2[0].startswith('_'):
+    if f2[0].startswith('_'): result = -1
+  # Enforce additional ordering within a block of identical host names
+  elif f1[0] == f2[0]:
+    # Enforce a preferred order for common resource record types
+    rr=['SOA', 'A', 'AAAA', 'CNAME', 'DNAME', 'NS', 'MX', 'TXT',
+        'TLSA', 'SSHFP']
+    x = y = len(rr)
+    if f1[3] in rr: x=rr.index(f1[3])
+    if f2[3] in rr: y=rr.index(f2[3])
+    # For identical resource records, sort alphabetically (with exceptions)
+    if x == y:
+      if f1[3] == 'NS':
+        # Name servers within our own zone should be listed first
+        if f1[4].endswith(zone + '.') != f2[4].endswith(zone + '.'):
+          if f1[4].endswith(zone + '.'): result = -1
+        # Group by domain names, and then within domains sort by host name
+        elif (re.sub(r'(.*)([.][^.]+){2}', r'\2\1', b) >
+              re.sub(r'(.*)([.][^.]+){2}', r'\2\1', a)): result = -1
+      elif a < b: result = -1
+    elif x < y: result = -1
+  else:
+    x = y = '~'
+    ## # If this host has an A record, sort by IP address
+    ## if f1[0] in hosts: x = hosts[f1[0]]
+    ## if f2[0] in hosts: y = hosts[f2[0]]
+    # Everything else is sorted alphabetically (i.e. by host names)
+    if x < y or f1[0] < f2[0]:
+      result = -1
+  return result
+lines.sort(key=functools.cmp_to_key(cmp))
+
+# Compute the widths of individual fields (after pruning, where possible)
+widths = []
+d = ['', '', '']
+records = [ ]
+for r in lines:
+  f = r.rstrip().split(None, 4)
+  # Remove zone name from host names
+  if f[0].endswith('.' + zone + '.'):
+    f[0] = f[0][:-len('.' + zone + '.')]
+  elif f[0] == zone + '.':
+    f[0] = '@'
+  e = copy.copy(f)
+  # Prune records that are identical to the line above
+  for i in range(0, 3):
+    if e[i] == d[i]:
+      e[i] = ''
+    elif i > 0:
+      break
+  # Update the maximum width per column
+  for i in range(0, len(e)):
+    if (len(widths) <= i): widths.append(0)
+    if len(e[i]) > widths[i]:
+      widths[i] = len(e[i])
+  records.append(e)
+  d = f
+# Don't pad the very last field
+widths[len(widths)-1] = 0
+
+# Now, we are finally ready to output the human-readable zone file
+p = None
+print('$ORIGIN ' + zone + '.')
+for r in records:
+  # Insert blank lines in between groups
+  if r[0] != '' and p == '': print
+  p = r[0]
+
+  # Assemble a full line from space-padded records
+  l = ''
+  for i in range(0, len(r)):
+    l += r[i].ljust(widths[i] + 1)
+
+  # Perform some amount of TAB compression in order to make it easier
+  # to edit the file. Only do this for the first stretch of white
+  # space in each line, though, as that's the one most likely to
+  # benefit from it. N.B. this stretch of white-space might or might
+  # not be preceded by a host name. That makes the math a little
+  # convoluted.
+  def compress(s):
+    regex = re.match(r'^(\S*)(\s+)(.*)', s)
+    group = [ regex.group(i) for i in range(0, 4) ]
+    width = [ len(g) for g in group ]
+    tabs  = ((width[1] % 8 != 0 and
+              ((width[1] + 7) & ~7) < (width[1] + width[2])) +
+             int(max(width[2] - ((8 - width[1]) & 7), 0) / 8))
+    spcs  = (((width[1] + width[2]) & 7) -
+             (tabs == 0)*(width[1] & 7))
+    return group[1] + '\t'*tabs + ' '*spcs + group[3]
+  print(compress(l))

@@ -32,7 +32,7 @@ lines = [ ]
 try:
   with open(zonefile, 'r') as f:
     lines = [ re.sub(r'^((\S+\s+){2})(.*)', r'\1IN\t\3',
-              re.sub(r'\s*;.*', '',
+              re.sub(r'^[^"]*\s*;.*', '',
               ' '.join(line.split()))) for line in f ]
     lines = [ line for line in lines if not len(line) == 0 ]
   if len(lines) > 0:
@@ -138,11 +138,11 @@ if len(lines) < 1:
                               rr.to_text()) ]
 
 # Extract a list of known A records. This will be used in sorting
-hosts = { }
-for r in lines:
-  f = r.split()
-  if f[3] == 'A':
-    hosts[f[0]] = f[4]
+# hosts = { }
+# for r in lines:
+#   f = r.split()
+#   if f[3] == 'A':
+#     hosts[f[0]] = f[4]
 
 # Sort lines to be in a more human-friendly natural order
 def cmp(a, b):

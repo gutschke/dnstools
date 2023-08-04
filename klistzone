@@ -31,10 +31,8 @@ zonefile = '/var/lib/knot/' + zone + '.zone'
 lines = [ ]
 try:
   with open(zonefile, 'r') as f:
-    lines = [ re.sub(r'^((\S+\s+){2})(.*)', r'\1IN\t\3',
-              re.sub(r'^[^"]*\s*;.*', '',
-              ' '.join(line.split()))) for line in f ]
-    lines = [ line for line in lines if not len(line) == 0 ]
+    zonerecords = dns.zone.from_file(f)
+  lines = zonerecords.to_text().splitlines()
   if len(lines) > 0:
     print(';; ZONE FILE READ FROM "{}"'.format(zonefile))
 except Exception:
@@ -151,8 +149,10 @@ def cmp(a, b):
   result = 1
   # The zone name information should always be first. In particular, this means
   # that the SOA record is always the very first line
-  if (f1[0] == zone + '.') != (f2[0] == zone + '.'):
-    if f1[0] == zone + '.': result = -1
+  if (f1[0] == zone + '.' or f1[0] == '@') != \
+     (f2[0] == zone + '.' or f2[0] == '@'):
+    if f1[0] == zone + '.' or f1[0] == '@':
+      result = -1
   # SRV resource records always come last
   elif (f1[3] == 'SRV') != (f2[3] == 'SRV'):
     if f2[3] == 'SRV': result = -1

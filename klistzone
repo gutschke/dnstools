@@ -7,7 +7,6 @@
 
 # Copyright 2016, 2023 Markus Gutschke
 
-from io import StringIO
 import copy
 import dns.query
 import dns.rdatatype
@@ -15,7 +14,6 @@ import dns.resolver
 import dns.zone
 import functools
 import re
-import sqlite3
 import sys
 
 # We accept exactly one command line argument

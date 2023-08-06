@@ -135,13 +135,6 @@ if len(lines) < 1:
               if not re.match(r'(\S+\s+){3}(DHCID|RRSIG|NSEC3?(PARAM)?|DNSKEY)',
                               rr.to_text()) ]
 
-# Extract a list of known A records. This will be used in sorting
-# hosts = { }
-# for r in lines:
-#   f = r.split()
-#   if f[3] == 'A':
-#     hosts[f[0]] = f[4]
-
 # If we have wildcard records, they should ideally apply to every single host.
 # That's not how DNS works though. And they have to be repeated manually in each
 # and every record. This is annoyingly verbose. To improve human readability,
@@ -205,12 +198,8 @@ def cmp(a, b):
       elif a < b: result = -1
     elif x < y: result = -1
   else:
-    x = y = '~'
-    ## # If this host has an A record, sort by IP address
-    ## if f1[0] in hosts: x = hosts[f1[0]]
-    ## if f2[0] in hosts: y = hosts[f2[0]]
     # Everything else is sorted alphabetically (i.e. by host names)
-    if x < y or f1[0] < f2[0]:
+    if f1[0] < f2[0]:
       result = -1
   return result
 lines.sort(key=functools.cmp_to_key(cmp))

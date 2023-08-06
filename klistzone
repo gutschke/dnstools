@@ -142,23 +142,46 @@ if len(lines) < 1:
 #   if f[3] == 'A':
 #     hosts[f[0]] = f[4]
 
+# If we have wildcard records, they should ideally apply to every single host.
+# That's not how DNS works though. And they have to be repeated manually in each
+# and every record. This is annoyingly verbose. To improve human readability,
+# we prune the repeated information when listing the zone and move those records
+# to the end of the zone file.
+wildcard = set()
+for l in lines:
+  if l.startswith('*'):
+    f = l.split(None, 5)
+    wildcard.add(' '.join(f[3:]))
+
 # Sort lines to be in a more human-friendly natural order
 def cmp(a, b):
   f1 = a.split(None, 5)
   f2 = b.split(None, 5)
   result = 1
+  # Move SSHFP to the end, as they tend to clutter things up
+  if (f1[3] == 'SSHFP') != (f2[3] == 'SSHFP'):
+    if f2[3] == 'SSHFP': result = -1
+  # Records duplicated from the wild-card hostname are just unwieldy clutter
+  # that should be moved out of the way
+  elif (not f1[0].startswith('*') and ' '.join(f1[3:]) in wildcard) != \
+       (not f2[0].startswith('*') and ' '.join(f2[3:]) in wildcard):
+    if not f2[0].startswith('*') and ' '.join(f2[3:]) in wildcard: result = -1
   # The zone name information should always be first. In particular, this means
   # that the SOA record is always the very first line
-  if (f1[0] == zone + '.' or f1[0] == '@') != \
+  elif (f1[0] == zone + '.' or f1[0] == '@') != \
      (f2[0] == zone + '.' or f2[0] == '@'):
     if f1[0] == zone + '.' or f1[0] == '@':
       result = -1
-  # SRV resource records always come last
-  elif (f1[3] == 'SRV') != (f2[3] == 'SRV'):
-    if f2[3] == 'SRV': result = -1
   # The zone name information is followed by wild-card host names, if any
   elif f1[0].startswith('*') != f2[0].startswith('*'):
     if f1[0].startswith('*'): result = -1
+  # _domainkey records should be at the end
+  elif ('._domainkey' in f1[0] and f1[3] == 'TXT') != \
+       ('._domainkey' in f2[0] and f2[3] == 'TXT'):
+    if '._domainkey' in f2[0] and f2[3] == 'TXT': result = -1
+  # SRV resource records always come at the end
+  elif (f1[3] == 'SRV') != (f2[3] == 'SRV'):
+    if f2[3] == 'SRV': result = -1
   # Host names that define services come at the end
   elif f1[0].startswith('_') != f2[0].startswith('_'):
     if f2[0].startswith('_'): result = -1
@@ -221,13 +244,8 @@ for r in lines:
 widths[len(widths)-1] = 0
 
 # Now, we are finally ready to output the human-readable zone file
-p = None
 print('$ORIGIN ' + zone + '.')
 for r in records:
-  # Insert blank lines in between groups
-  if r[0] != '' and p == '': print
-  p = r[0]
-
   # Assemble a full line from space-padded records
   l = ''
   for i in range(0, len(r)):
@@ -248,5 +266,12 @@ for r in records:
              int(max(width[2] - ((8 - width[1]) & 7), 0) / 8))
     spcs  = (((width[1] + width[2]) & 7) -
              (tabs == 0)*(width[1] & 7))
+    # Emacs interprets TABs differently from terminals, iff the TAB
+    # character happens to be in column 7. The work-around would be to
+    # replace that one TAB character with a space. This ensures that
+    # both Emacs and terminal programs render the same output
+    if width[1] & 7 == 7 and tabs > 0:
+      group[1] = group[1] + ' '
+      tabs = tabs - 1
     return group[1] + '\t'*tabs + ' '*spcs + group[3]
   print(compress(l))

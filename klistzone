@@ -13,6 +13,7 @@ import dns.rdatatype
 import dns.resolver
 import dns.zone
 import functools
+import io
 import re
 import sys
 
@@ -80,13 +81,13 @@ if len(lines) < 1:
       port = 53
 
     try:
-      str = StringIO()
+      s = io.StringIO()
       master = dns.resolver.resolve(server, "A")
       axfr = dns.query.xfr(master[0].address, zone, timeout=10, port=port,
                           lifetime=10, relativize=False)
       axfrZone = dns.zone.from_xfr(axfr, relativize=False)
-      axfrZone.to_file(str, relativize=False, nl='\n')
-      lines = [ l for l in str.getvalue().splitlines() \
+      axfrZone.to_file(s, relativize=False, nl='\n')
+      lines = [ l for l in s.getvalue().splitlines() \
                 if not re.match(r'(\S+\s+){3}(DHCID|RRSIG|NSEC3?(PARAM)?|DNSKEY)', l) ]
       str.close()
       break
@@ -202,36 +203,56 @@ def cmp(a, b):
   return result
 lines.sort(key=functools.cmp_to_key(cmp))
 
+# Unfortunately, different programs interpret RFCs in a variety of ways, and
+# there is no universal agreement on how to handle omitted per-RR TTL
+# information, if there is no $TTL directive either. Let's be extra
+# conservative in how we read and write bind files. We always retrieve the
+# default TTL from the SOA record, and we explicitly set a $TTL on output.
+# When omitting the default TTL from a record, only do so, if it was already
+# explicitly stated on the preceding line. That not only makes things easier
+# to read for humans, it also avoids the ambiguity when using different
+# types of parsers.
+soa = lines[0].split()
+defaultTTL = soa[10]
+for i in range(4, 6):
+  # Correct any host records that might have gotten mangled
+  soa[i] = re.sub(r'(' + re.escape('.' + zone) + r')+\.?$',
+                  '.' + zone + '.', soa[i])
+lines[0] = ' '.join(soa)
+
 # Compute the widths of individual fields (after pruning, where possible)
 widths = []
-d = ['', '', '']
+prevFields = ['', '', '']
 records = [ ]
-for r in lines:
-  f = r.rstrip().split(None, 4)
+for rr in lines:
+  fields = rr.rstrip().split(None, 4)
   # Remove zone name from host names
-  if f[0].endswith('.' + zone + '.'):
-    f[0] = f[0][:-len('.' + zone + '.')]
-  elif f[0] == zone + '.':
-    f[0] = '@'
-  e = copy.copy(f)
+  if fields[0].endswith('.' + zone + '.'):
+    fields[0] = fields[0][:-len('.' + zone + '.')]
+  elif fields[0] == zone + '.':
+    fields[0] = '@'
+  prettyFields = copy.copy(fields)
   # Prune records that are identical to the line above
   for i in range(0, 3):
-    if e[i] == d[i]:
-      e[i] = ''
+    if i == 1 and prettyFields[i] == defaultTTL and prevFields[i] == defaultTTL:
+      prettyFields[1] = ''
+    elif i != 1 and prettyFields[i] == prevFields[i]:
+      prettyFields[i] = ''
     elif i > 0:
       break
   # Update the maximum width per column
-  for i in range(0, len(e)):
+  for i in range(0, len(prettyFields)):
     if (len(widths) <= i): widths.append(0)
-    if len(e[i]) > widths[i]:
-      widths[i] = len(e[i])
-  records.append(e)
-  d = f
+    if len(prettyFields[i]) > widths[i]:
+      widths[i] = len(prettyFields[i])
+  records.append(prettyFields)
+  prevFields = fields
 # Don't pad the very last field
 widths[len(widths)-1] = 0
 
 # Now, we are finally ready to output the human-readable zone file
 print('$ORIGIN ' + zone + '.')
+print('$TTL ' + defaultTTL)
 for r in records:
   # Assemble a full line from space-padded records
   l = ''

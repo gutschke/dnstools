@@ -30,7 +30,7 @@ zonefile = '/var/lib/knot/' + zone + '.zone'
 lines = [ ]
 try:
   with open(zonefile, 'r') as f:
-    zonerecords = dns.zone.from_file(f)
+    zonerecords = dns.zone.from_file(f, origin = zone)
   lines = zonerecords.to_text().splitlines()
   if len(lines) > 0:
     print(';; ZONE FILE READ FROM "{}"'.format(zonefile))

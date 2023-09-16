@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+
+# Accepts a series of modifications to the DNS records on the command line, and
+# submits them to the DNS server. This is a convenient wrapper around
+# "knsupdate". It does a lot of tedious work to sanitize the input in a
+# way that makes it acceptable to the DNS server.
+#
+# Copyright 2023 Markus Gutschke
+
+KNOTCONF='/etc/knot/knot.conf'
+
+import dns.resolver
+import re
+import subprocess
+import sys
+import yaml
+
+# If we weren't invoked with the expected set of parameters, print usage
+# information and exit.
+def usage():
+  print('Usage: ' + sys.argv[0].split('/')[-1] + ' {--debug}' +
+        ' [ add | delete ] HOST{fqdn} {ttl} {class} {type} ADDR -- ...',
+        file = sys.stderr)
+  exit(1)
+
+# Find the authorization information that is required to update the zone
+# for a given "domain".
+def findKey(domain):
+  for dom in knotCfg['zone']:
+    if dom['domain'].rstrip('.') != domain.rstrip('.'): continue
+    for id in dom['acl']:
+      for acl in knotCfg['acl']:
+        if acl['id'] != id or acl['action'] != 'update': continue
+        for key in knotCfg['key']:
+          if key['id'] != acl['key']: continue
+          return key['algorithm'] + ':' + key['id'] + ':' + key['secret']
+
+# Find the default port number for talking to our local DNS server.
+localPort = None
+def findPort():
+  global localPort
+  if localPort:
+    return localPort
+  port = None
+  for l in knotCfg['server']['listen']:
+    regex = re.findall(r'.*@(.*)', l)
+    if not port and regex: port = regex[0]
+    if re.search(r'^0[.]0[.]0[.]0|127[.][0-9.]*|::|::1$', l):
+      port = '53'
+      if regex:
+        port = regex[0]
+      break
+  localPort = port or '53'
+  return localPort
+
+# Retrieve the current token from the command line, paying special attention
+# to "--" delimiters.
+argN = 1
+def arg(n = 1):
+  if argN + n > len(sys.argv):
+    return ''
+  for i in range(n):
+    if sys.argv[argN + i] == '--':
+      return ''
+  return sys.argv[argN + n - 1]
+
+# Retrieve the remaining parameters for the current command up to any '--'
+# delimiter, but don't consume any of these arguments.
+def remainder():
+  s = ''
+  for i in range(argN, len(sys.argv)):
+    if sys.argv[i] == '--': break
+    s = s + ' ' + sys.argv[i]
+  return s
+
+# Advance the command line parser by one token, but don't move past the '--'
+# delimiter.
+def next():
+  global argN
+  if argN < len(sys.argv) and sys.argv[argN] != '--':
+    argN = argN + 1
+
+# Undo a next() operation.
+def unshift(n = 1):
+  global argN
+  argN = argN - n
+
+# Combine arg() and next() to retrieve and consume the next token.
+def nextArg():
+  s = arg()
+  next()
+  return s
+
+# Advance to the next command by moving beyond the "--" delimiter.
+def nextCmd():
+  global argN
+  for i in range(argN, len(sys.argv)):
+    if sys.argv[i] != '--': continue
+    for j in range(i + 1, len(sys.argv)):
+      if sys.argv[j] != '--':
+        argN = j
+        return True
+  argN = len(sys.argv)
+  return
+
+# Sanitize the hostname and fully qualify it. This function uses a couple of
+# heuristics that should compensate for common mistakes, but that could at
+# times guess incorrectly. So, if in doubt, it is advisable to always pass in
+# hostnames that have already been sanitized and qualified.
+def fqdn(host):
+  if not host: return
+  if host == '@': host = (lastZone or domains[0]) + '.'
+  lz = (re.escape(lastZone) + r'|') if lastZone else r''
+  looksGood = re.compile(r'(' + lz + r'[.]arpa|' +
+                         r'|'.join([ re.escape(d) for d in domains ]) + r')$')
+  if host[-1] != '.':
+    # Some hosts are fully-qualified but are simply missing the trailing period.
+    # It's impossible to tell with absolute certainty, but we can make an
+    # educated guess. If so, simply attach the period and continue.
+    lz = (re.escape(lastZone) + r'|') if lastZone else r''
+    if re.search(looksGood, host):
+      host = host + '.'
+    else:
+      # This host was not qualified and we have to append a domain. From
+      # context, we can usually tell whether it is the default domain or the
+      # one that we have used most recently.
+      host = host + '.' + (lastZone or domains[0]) + '.'
+  # By this point, we have a candidate for a fully-qualified host name ending
+  # in a trailing period.
+  if not re.search(looksGood, host.rstrip('.')):
+    # Host pretends to be fully-qualified, but doesn't really pass our basic
+    # sanity checks. This is a bit of a gamble, but we should try appending a
+    # domain.
+    host = host + (lastZone or domains[0]) + '.'
+  # It's easy to accidentally append domains multiple times. This could have
+  # happened in this script, but more likely, it could also have happened
+  # at any other time when DNS was configured. Strip any duplicates.
+  return re.sub(r'(?<![-a-zA-Z0-9])([-a-zA-Z0-9.]+)([.]\1)+[.]?$', r'\1.', host)
+
+# Find the domain part of a fully-qualified hostname.
+def domain(host):
+  host = host.rstrip('.')
+  for d in domains:
+    if host == d or host.endswith('.' + d):
+      return d
+  return re.sub(r'^[^.]*[.]', '', host.rstrip('.'))
+
+# Find the default TTL for a given zone
+ttlsByZone = { }
+def defTTL(dom):
+  global ttlsByZone
+  if dom in ttlsByZone:
+    return ttlsByZone[dom]
+  res = dns.resolver.Resolver()
+  res.nameservers = ['127.0.0.1', '::1']
+  res.port = int(findPort())
+  rr = res.resolve(dom, 'SOA')
+  val = str(rr[0]).split()
+  return val[-1]
+
+
+# Load "knot.conf" and handle zones that might be stored in an include file.
+# The DNS server's configuration file has (most) of the site-specific
+# custom information that we need to make things work seamlessly.
+with open(KNOTCONF, 'r') as f:
+  knotCfg = yaml.load(f, Loader=yaml.BaseLoader)
+  if 'include' in knotCfg:
+    with open(knotCfg.pop('include')) as f:
+      knotCfg.update(yaml.load(f, Loader=yaml.BaseLoader))
+
+# If the user did not provide any fully-qualified domain names, and we can't
+# infer the domain name from context either, then fall back to the very first
+# zone defined by the DNS server.
+# We also use the list of zones to figure out where to split the hostname
+# from the domain name and to sanity-check any hostnames that we come across.
+domains = [ zone['domain'].rstrip('.') for zone in knotCfg['zone'] ]
+# Reverse sort the list, so that we check for more specific domain names
+# before checking for more generic ones. But retain the first element as that's
+# used when we need to guess a default domain name.
+domains = [ domains[0] ] + sorted(domains[1:], reverse = True)
+
+# Parse the command line arguments and build a list of instructions that can
+# be passed to knsupdate. We allow omitting many of the fields, if the caller
+# prefers to leave them unspecified. This makes parsing the command line a
+# little more difficult, though.
+insn = 'server localhost {}\n'.format(findPort())
+lastZone = ''
+debug = None
+while True:
+  cmd = nextArg()
+  if cmd == '--debug':
+    debug = True
+    print(' '.join(sys.argv) + '\n')
+    continue
+  # Every operation must start with "add" or "delete".
+  if cmd != 'add' and cmd != 'delete': usage()
+  # Hosts should be qualified, but unqualified hostnames will usually be
+  # deduced correctly. This parameter is mandatory.
+  host = fqdn(nextArg())
+  if not host: usage()
+  # TTL and class are optional.
+  ttl = None
+  if re.search(r'^\d+$', arg()): ttl = nextArg()
+  if arg().upper() == 'IN': next()
+  if not ttl and re.search(r'^\d+$', arg()): ttl = nextArg()
+  # If the record type isn't mentioned, we can deduce it from the format of
+  # the address (IPv4 -> A, IPv6 -> AAAA)
+  typ = None
+  if re.search(r'^[a-zA-Z]+$', arg()): typ = nextArg().upper()
+  if not arg(2) and \
+     re.search(r'^(?:[1-9][0-9]{0,2}[.]){3}[1-9][0-9]{0,2}|' +
+               r'[0-9a-fA-F:]+:[0-9a-fA-F:]*$', arg()):
+    typ = 'AAAA' if re.search(r':', arg()) else 'A'
+  # Deletions don't need any more parameters and will happily apply to all
+  # matching records. Additions need a few more details to fill in the value
+  # of the new record.
+  if cmd != 'delete' and not remainder(): usage()
+  if not typ: usage()
+  # SOA records frequently get mangled accidentally. Correct the hostnames
+  # that are part of this record.
+  rem = remainder()
+  if typ == 'SOA':
+    # If adding an SOA record for a brand-new zone, add to our list of
+    # domains. This will make the "fqdn()" function work properly for the
+    # rest of the execution of this script.
+    if not host.rstrip('.') in domains:
+      domains.push(host.rstrip('.'))
+    data = rem.split()
+    data[0] = fqdn(data[0])
+    data[1] = fqdn(data[1])
+    ttlsByZone[host.rstrip('.')] = data[6]
+    rem = ' '.join(data)
+  # Repair any hostnames that our DNS records refer to in their value. They
+  # should all be fully qualified.
+  if re.search(r'^MX|NS|CNAME|SRV$', typ):
+    data = rem.split()
+    data[-1] = fqdn(data[-1])
+    rem = ' '.join(data)
+  # Keep track of the domain that we are operating on. If the domain changes,
+  # we need to tell "knsupdate" to start a new transaction.
+  dom = domain(host)
+  if dom != lastZone:
+    if lastZone:
+      insn = insn + 'send\n'
+    insn = insn + 'key ' + findKey(dom) + '\nzone ' + dom + '\n'
+    lastZone = dom
+  # We always make it a point to send a TTL to the DNS server. If the caller
+  # didn't provide one, use the TTL in the SOA record for this zone.
+  if not ttl:
+    ttl = defTTL(dom) if cmd == 'add' else ''
+  # Now assemble our instruction to the DNS server.
+  insn = insn + cmd + ' ' + host + ' ' + ttl + ' IN ' + typ + ' ' + rem + '\n'
+  if not nextCmd():
+    break
+if not lastZone:
+  exit(0)
+insn = insn + 'send\n'
+
+# Once we have a full stream of instructions, we can send them in one go.
+knsupdate = ['knsupdate']
+if debug:
+  knsupdate = knsupdate + ['-d']
+  print('Instructions:\n' + insn)
+with subprocess.Popen(knsupdate, stdin = subprocess.PIPE) as proc:
+  proc.stdin.write(insn.encode('utf-8'))
+  proc.stdin.close()
+  proc.wait()
+exit(0)

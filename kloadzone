@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+
+# This script tries to load a zone file and merge it with the records served
+# by the DNS server running on this host. It additionally performs a couple
+# of sanity checks and commonly required edits.
+#
+# We assume that knot has already been set up on this machine and is working
+# correctly. Ideally, the zone that is being loaded already exists on the
+# server, and all we have to do is send a couple of dynDNS-style updates. But
+# if this is a completely new zone, we will make a best effort to update the
+# knot configuration files accordingly.
+
+# Copyright 2023 Markus Gutschke
+
+KNOTCONF='/etc/knot/knot.conf'
+
+import copy
+import dns.zone
+import re
+import subprocess
+import sys
+import yaml
+
+
+# We accept exactly one command line argument
+if len(sys.argv) != 2:
+  sys.stderr.write('Usage: {} ZONE-FILE\n'.format(
+    re.sub(r'.*/', '', sys.argv[0])))
+  exit(1)
+zonefile = sys.argv[1]
+
+# Load "knot.conf" and handle zones that might be stored in an include file.
+# The DNS server's configuration file has (most) of the site-specific
+# custom information that we need to make things work seamlessly.
+with open(KNOTCONF, 'r') as f:
+  knotCfg = yaml.load(f, Loader=yaml.BaseLoader)
+  if 'include' in knotCfg:
+    with open(knotCfg['include']) as f:
+      knotCfg.update(yaml.load(f, Loader=yaml.BaseLoader))
+
+# Load the zone file from disk
+lines = [ ]
+try:
+  with open(zonefile, 'r') as f:
+    text = f.read()
+  # Python's bind file parser doesn't know about $TTL and $ORIGIN directives.
+  # That's a little tedious, as we have to handle them ourselves.
+  lines = text.splitlines()
+  ttl = ''
+  origin = ''
+  last = ''
+  for i in range(len(lines)):
+    # Check for $TTL directive
+    match = re.findall(r'^\s*(\$ttl\s+(\d+))', lines[i], re.I)
+    if match:
+      ttl = match[0][1]
+      lines[i] = '; ' + match[0][0]
+      continue
+    else:
+      # Check for $ORIGIN directive
+      match = re.findall(r'^\s*(\$origin\s+(\S+))', lines[i], re.I)
+      if match:
+        origin = match[0][1].rstrip('.') + '.'
+        lines[i] = '; ' + match[0][0]
+        continue
+    # Apply the values that we learned from the $TTL and $ORIGIN directives
+    # First, strip any comments, paying careful attention to quoted strings
+    # that can contain semicolons.
+    comment = re.findall(r'^(?:[^;]*(?:"[^"]*"|\([^)]*\)))*[^;"(]*;(.*)',
+                         lines[i])
+    comment = ';' + comment[0] if comment else ''
+    line = lines[i][:-len(comment)] if len(comment) else lines[i]
+    # Resource records are actually somewhat flexible in how they are formatted.
+    # This makes for a rather complicated regular expression and requires us to
+    # explicitly list the supported types.
+    match = re.findall(r'^\s*(?:((?![0-9])\S+)\s+)?(in\s+)?(?:(\d+)\s+)?' +
+                       r'(in\s+)?' +
+                       r'(a|aaaa|caa|cert|cname|dnskey|ds|https|loc|mx|' +
+                        r'naptr|ns|ptr|smimea|soa|srv|sshfp|tlsa|txt|uri)' +
+                       r'\s+(\S.*)', line, re.I)
+    # If we can't make sense of the line, better leave it alone
+    if not match:
+      continue
+    rr = list(match[0])
+    # SOA records can easily end up with misformed information that we
+    # should patch up now.
+    if rr[4].upper() == 'SOA':
+      # This is also a great opportunity to retrieve the origin, if wasn't
+      # specified already.
+      if not origin and rr[0] and rr[0][-1] == '.':
+        origin = rr[0]
+      data = rr[5].split()
+      # The default TTL can alternatively be found in the SOA record
+      if not ttl and data[6]:
+        ttl = data[6]
+      # Canonicalize name server and admin e-mail
+      for j in (0, 1):
+        if not re.search(r'\.$', data[j]):
+          data[j] = data[j] + '.' + origin
+        data[j] = re.sub(r'(' + re.escape('.' + origin.rstrip('.')) + r')+\.$',
+                         '', data[j])
+        if not data[j]:
+          data[j] = origin
+      rr[5] = ' '.join(data)
+    # Add missing host names by repeating the previous one
+    if not rr[0] and last:
+      rr[0] = last
+    last = rr[0]
+    # Substitute '@' with the origin
+    if rr[0] == '@':
+      if not origin:
+        print('Origin has not been set; can\'t use \'@\'')
+        exit(1)
+      rr[0] = origin
+    # Don't touch '*'
+    elif rr[0] != '*':
+      # Fix common mistakes. Append the origin to unqualified host names; then
+      # strip erroneously duplicated origins. And fix up empty hostnames.
+      # The upshot is that we'll get unqualified hostnames everywhere, except
+      # for when referring to the origin itself.
+      if not re.search(r'\.$', rr[0]):
+        rr[0] = rr[0] + '.' + origin
+      rr[0] = re.sub(
+        r'(' + re.escape('.' + origin.rstrip('.')) + r')+\.$', '', rr[0])
+      if not rr[0]:
+        rr[0] = origin
+    # If the record didn't explicitly set a TTL, substitute the default TTL.
+    if not rr[2]:
+      if not ttl:
+        print('Don\'t know the default TTL')
+        exit(1)
+      rr[2] = ttl
+    # Now, put everything back together
+    lines[i] = ' '.join(rr)
+  # Finally, let Python parse the bind file and check that it is valid
+  zone = dns.zone.from_text('\n'.join(lines), origin = origin)
+  # Do one final iteration of origin replacements, as they might not have been
+  # possible on the first pass.
+  lines = [ re.sub(r'^@(?=\s)', origin, rr)
+            for rr in zone.to_text().splitlines() ]
+  if len(lines) <= 0:
+    print('Failed to read any records from zone file')
+    exit(1)
+except Exception as e:
+  print(repr(e))
+  print('Failed to read zone file')
+  exit(1)
+
+# Read the database for this zone as in use by the local DNS server. Use some
+# reasonable defaults, if the configuration file doesn't appear to be
+# complete.
+if 'template' in knotCfg and knotCfg['template']:
+  db = knotCfg['template'][0]['storage'] + '/' + \
+       knotCfg['template'][0]['file'].replace('%s',str(zone.origin).rstrip('.'))
+elif knotCfg['database'] and knotCfg['database']['storage']:
+  db = knotCfg['database']['storage'] + '/' + str(zone.origin) + 'zone'
+else:
+  db = '/var/lib/knot/' + str(zone.origin) + 'zone'
+
+try:
+  with open(db, 'r') as f:
+    old = dns.zone.from_file(f, origin = zone.origin)
+  # Expand the origin, so that we can easily compare it with our newly
+  # loaded zone file.
+  oldLines = [ re.sub(r'^@(?=\s)', origin, rr)
+               for rr in old.to_text().splitlines() ]
+except:
+  oldLines = [ ]
+  print('The local DNS server does not appear to know about "{}"\n'.format(
+        str(zone.origin)) +
+        'Creating new domain and reloading configuration file.')
+  try:
+    # Ideally, the on-disk zone file is missing, but the configuration file has
+    # been updated to reflect the new zone. If so, that saves us a lot of work.
+    existing = None
+    for z in knotCfg['zone']:
+      if z['domain'].rstrip('.') == origin.rstrip('.'):
+        existing = True
+        break
+    # If the configuration file hasn't been updated, we will attempt to do so
+    # now. This is difficult because of the limited syntax supported by knot,
+    # and because we don't want to accidentally destroy formatting information
+    # that the user added intentionally.
+    # We can only handle the special case where the user moved all zone-related
+    # information to its own file.
+    if not existing:
+      if not 'include' in knotCfg:
+        print('Cannot automatically add new zone. Please edit "{}" manually\n' \
+              .format(KNOTCONF))
+      else:
+        # The configuration file uses an include statement to refer to the
+        # list of zones. This is something we know how to handle.
+        #
+        # If there are existing records, use them as a template for our new zone
+        zoneCfg = { }
+        if knotCfg['zone']:
+          zoneCfg = copy.deepcopy(knotCfg['zone'][0])
+          if 'domain' in zoneCfg: zoneCfg.pop('domain')
+        else:
+          # If there are no existing records to copy, then at least try to find
+          # the required access control information. Without setting up those
+          # permissions, we won't be able to do dynamic updates; and we do rely
+          # on those working.
+          if knotCfg['acl']:
+            for acl in knotCfg['acl']:
+              if 'action' in acl and acl['action'] == 'update': break
+          if acl: zoneCfg['acl'] = [ acl['id'] ]
+        # Now add the new entry to the list of known zones.
+        with open(knotCfg['include'], 'a') as conf:
+          # YAML isn't very amenable to automatic edits, and knot's version is
+          # particularly finicky. Manually assemble a configuration snippet as
+          # best as we know how to.
+          conf.write(
+            '  - domain: ' + origin.rstrip('.') + '\n' +
+            '\n'.join([ '    {}: {}'.
+                            format(entry, repr(zoneCfg[entry]).replace("'", ''))
+                            for entry in zoneCfg ]) +
+            '\n')
+
+    # Write the initial zone file; this is just what we are loading.
+    with open(db, 'w') as zone:
+      zone.write('\n'.join(lines))
+    subprocess.call([
+      '/usr/bin/chown',
+      'knot:knot' if not 'user' in knotCfg['server']
+                  else knotCfg['server']['user'],
+      db])
+    # Reload the knot server with the new zone.
+    if subprocess.call(['/usr/bin/systemctl', 'reload', 'knot.service']) != 0:
+      print('Failed to reload DNS configuration.')
+      exit(1)
+    oldLines = lines
+  except Exception as e:
+    print(repr(e))
+    print('Can\'t create config files for zone "{}"'.format(str(zone.origin)))
+    exit(1)
+
+# The SOA record needs to be treated specially when computing difference.
+serial = ''
+for line in oldLines:
+  # Find the original SOA record and retrieve the serial number
+  match = re.findall(r'^\s*(?:((?![0-9])\S+)\s+)?(in\s+)?(?:(\d+)\s+)?' +
+                     r'(in\s+)?(soa)\s+(\S.*)', line, re.I)
+  if not match:
+    continue
+  data = match[0][5].split()
+  serial = data[2]
+  break
+if serial:
+  for i in range(len(lines)):
+    match = re.findall(r'^\s*(?:((?![0-9])\S+)\s+)?(in\s+)?(?:(\d+)\s+)?' +
+                       r'(in\s+)?(soa)\s+(\S.*)', lines[i], re.I)
+    if not match:
+      continue
+    rr = list(match[0])
+    data = rr[5].split()
+    # If the serial number doesn't increase, we might have to do some
+    # adjustments
+    if int(data[2]) <= int(serial):
+      # If the only difference is in the serial number, then omit the
+      # SOA record from the list of changes
+      data[2] = serial
+      rr[5] = ' '.join(data)
+      lines[i] = ' '.join(rr).replace('  ', ' ')
+      if line != lines[i]:
+        # But if there are other changes than just the serial number, then
+        # make sure the serial number advances. Otherwise, the change won't
+        # be accepted by the server
+        data[2] = str(int(serial) + 1)
+        rr[5] = ' '.join(data)
+        lines[i] = ' '.join(rr).replace('  ', ' ')
+    break
+
+# Compute delta of changes requested.
+deletions = list(set(oldLines) - set(lines))
+additions = list(set(lines) - set(oldLines))
+
+# Log what we are about to do.
+# for l in deletions:
+#   print('- ' + l)
+# for l in additions:
+#   print('+ ' + l)
+
+# Now inform the DNS server of our changes.
+if deletions or additions:
+  cmd = (('delete ' if deletions else '') +
+         ' -- delete '.join(deletions) +
+         (' -- add ' if additions else '') +
+         ' -- add '.join(additions)).replace('@', origin)
+  if subprocess.call(['kddnsupdate'] + cmd.split()) != 0:
+    print('Failed to update DNS server with new records.')
+    exit(1)
+
+exit(0)

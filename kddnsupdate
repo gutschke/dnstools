@@ -70,7 +70,7 @@ def remainder():
   s = ''
   for i in range(argN, len(sys.argv)):
     if sys.argv[i] == '--': break
-    s = s + ' ' + sys.argv[i]
+    s = (s + ' ' if s else '') + sys.argv[i]
   return s
 
 # Advance the command line parser by one token, but don't move past the '--'
@@ -188,6 +188,10 @@ lastZone = ''
 debug = None
 while True:
   cmd = nextArg()
+  if not cmd:
+    if not nextCmd():
+      break
+    continue
   if cmd == '--debug':
     debug = True
     print(' '.join(sys.argv) + '\n')
@@ -234,8 +238,9 @@ while True:
   # should all be fully qualified.
   if re.search(r'^MX|NS|CNAME|SRV$', typ):
     data = rem.split()
-    data[-1] = fqdn(data[-1])
-    rem = ' '.join(data)
+    if data:
+      data[-1] = fqdn(data[-1])
+      rem = ' '.join(data)
   # Keep track of the domain that we are operating on. If the domain changes,
   # we need to tell "knsupdate" to start a new transaction.
   dom = domain(host)

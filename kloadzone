@@ -41,7 +41,7 @@ with open(KNOTCONF, 'r') as f:
 # Load the zone file from disk
 lines = [ ]
 try:
-  with open(zonefile, 'r') as f:
+  with (sys.stdin if zonefile == '-' else open(zonefile, 'r')) as f:
     text = f.read()
   # Python's bind file parser doesn't know about $TTL and $ORIGIN directives.
   # That's a little tedious, as we have to handle them ourselves.
@@ -134,10 +134,11 @@ try:
     lines[i] = ' '.join(rr)
   # Finally, let Python parse the bind file and check that it is valid
   zone = dns.zone.from_text('\n'.join(lines), origin = origin)
+  print(zone.to_text(relativize = False))
   # Do one final iteration of origin replacements, as they might not have been
   # possible on the first pass.
   lines = [ re.sub(r'^@(?=\s)', origin, rr)
-            for rr in zone.to_text().splitlines() ]
+            for rr in zone.to_text(relativize = False).splitlines() ]
   if len(lines) <= 0:
     print('Failed to read any records from zone file')
     exit(1)
@@ -163,7 +164,7 @@ try:
   # Expand the origin, so that we can easily compare it with our newly
   # loaded zone file.
   oldLines = [ re.sub(r'^@(?=\s)', origin, rr)
-               for rr in old.to_text().splitlines() ]
+               for rr in old.to_text(relativize = False).splitlines() ]
 except:
   oldLines = [ ]
   print('The local DNS server does not appear to know about "{}"\n'.format(

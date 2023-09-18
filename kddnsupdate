@@ -135,7 +135,7 @@ def fqdn(host):
   # It's easy to accidentally append domains multiple times. This could have
   # happened in this script, but more likely, it could also have happened
   # at any other time when DNS was configured. Strip any duplicates.
-  return re.sub(r'(?<![-a-zA-Z0-9])([-a-zA-Z0-9.]+)([.]\1)+[.]?$', r'\1.', host)
+  return re.sub(r'(?<![-_a-zA-Z0-9])([-_a-zA-Z0-9.]+)([.]\1)+[.]?$',r'\1.',host)
 
 # Find the domain part of a fully-qualified hostname.
 def domain(host):

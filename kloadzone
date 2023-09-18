@@ -134,7 +134,6 @@ try:
     lines[i] = ' '.join(rr)
   # Finally, let Python parse the bind file and check that it is valid
   zone = dns.zone.from_text('\n'.join(lines), origin = origin)
-  print(zone.to_text(relativize = False))
   # Do one final iteration of origin replacements, as they might not have been
   # possible on the first pass.
   lines = [ re.sub(r'^@(?=\s)', origin, rr)

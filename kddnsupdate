@@ -107,7 +107,7 @@ def nextCmd():
 # heuristics that should compensate for common mistakes, but that could at
 # times guess incorrectly. So, if in doubt, it is advisable to always pass in
 # hostnames that have already been sanitized and qualified.
-def fqdn(host):
+def fqdn(host, forceSanity = True):
   if not host: return
   if host == '@': host = (lastZone or domains[0]) + '.'
   lz = (re.escape(lastZone) + r'|') if lastZone else r''
@@ -127,7 +127,7 @@ def fqdn(host):
       host = host + '.' + (lastZone or domains[0]) + '.'
   # By this point, we have a candidate for a fully-qualified host name ending
   # in a trailing period.
-  if not re.search(looksGood, host.rstrip('.')):
+  if forceSanity and not re.search(looksGood, host.rstrip('.')):
     # Host pretends to be fully-qualified, but doesn't really pass our basic
     # sanity checks. This is a bit of a gamble, but we should try appending a
     # domain.
@@ -239,7 +239,7 @@ while True:
   if re.search(r'^MX|NS|CNAME|SRV$', typ):
     data = rem.split()
     if data:
-      data[-1] = fqdn(data[-1])
+      data[-1] = fqdn(data[-1], False)
       rem = ' '.join(data)
   # Keep track of the domain that we are operating on. If the domain changes,
   # we need to tell "knsupdate" to start a new transaction.

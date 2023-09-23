@@ -130,6 +130,10 @@ try:
         print('Don\'t know the default TTL')
         exit(1)
       rr[2] = ttl
+    # Python's zone file parser gets confused, if TXT records aren't quoted.
+    if rr[4].upper() == 'TXT' and \
+       not rr[5].startswith('"') and not rr[5].startswith('('):
+        rr[5] = '"' + rr[5].replace('"', '\\"') + '"'
     # Now, put everything back together
     lines[i] = ' '.join(rr)
   # Finally, let Python parse the bind file and check that it is valid

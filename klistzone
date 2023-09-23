@@ -270,7 +270,7 @@ for r in records:
     group = [ regex.group(i) for i in range(0, 4) ]
     width = [ len(g) for g in group ]
     tabs  = ((width[1] % 8 != 0 and
-              ((width[1] + 7) & ~7) < (width[1] + width[2])) +
+              ((width[1] + 7) & ~7) <= (width[1] + width[2])) +
              int(max(width[2] - ((8 - width[1]) & 7), 0) / 8))
     spcs  = (((width[1] + width[2]) & 7) -
              (tabs == 0)*(width[1] & 7))
